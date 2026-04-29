@@ -1,0 +1,429 @@
+---
+title: "BLAST Primer Specificity Report"
+subtitle: "Sea Otter SNP Genotyping Panel"
+author: "Ellen Dymit"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center"
+)
+```
+
+## Settings
+
+Edit these before knitting if your file paths or thresholds differ.
+
+```{r settings, echo=TRUE}
+INPUT_CSV      <- "summary.csv"   # path to your BLAST summary CSV
+OUTDIR         <- "blast_figures" # output folder for saved CSVs
+PCT_CUTOFF_LO  <- 85              # conservative threshold (3 mismatches in ~20 bp)
+PCT_CUTOFF_HI  <- 90              # stringent threshold (2 mismatches in ~20 bp)
+PCT_CUTOFF_PERFECT <- 100         # perfect match - highest concern
+EVALUE_CUTOFF  <- 0.01            # e-value threshold (secondary filter)
+TARGET_SPECIES <- "sea_otter"     # should have hits - that's expected
+```
+
+---
+
+## Setup
+
+```{r libraries}
+library(tidyverse)
+library(ggplot2)
+library(scales)
+library(knitr)
+library(kableExtra)
+
+dir.create(OUTDIR, showWarnings = FALSE)
+```
+
+```{r load-data}
+raw <- read_csv(INPUT_CSV, show_col_types = FALSE)
+
+# Separate real hits from no-hit placeholders
+hits <- raw %>%
+  filter(hit_id != "NO_HIT") %>%
+  mutate(
+    pct_identity   = as.numeric(pct_identity),
+    hsp_evalue     = as.numeric(hsp_evalue),
+    spans_junction = as.logical(spans_junction),
+    is_nontarget   = species != TARGET_SPECIES
+  )
+
+all_pairs         <- sort(unique(raw$pair_name))
+all_species       <- sort(unique(raw$species))
+nontarget_species <- setdiff(all_species, TARGET_SPECIES)
+```
+
+Loaded **`r nrow(raw)`** rows covering **`r n_distinct(raw$pair_name)`** primer pairs 
+across **`r n_distinct(raw$species)`** species 
+(`r paste(sort(unique(raw$species)), collapse = ", ")`).
+
+---
+
+## Summary Table
+
+Three identity flags are computed for each pair:
+
+- **flag_85** - any non-target hit with pct_identity > `r PCT_CUTOFF_LO`% (conservative; 3 mismatches in a 20 bp primer)
+- **flag_90** - any non-target hit with pct_identity > `r PCT_CUTOFF_HI`% (stringent; 2 mismatches in a 20 bp primer)
+- **flag_100** - any non-target hit with pct_identity = 100% (perfect match; highest concern)
+
+The `recommendation` column uses 100% as "CRITICAL", 90% as "MANUAL CHECK", 85-90% as "REVIEW".
+
+```{r pair-summary}
+pair_summary <- expand_grid(pair_name = all_pairs) %>%
+  left_join(
+    raw %>%
+      group_by(pair_name) %>%
+      summarise(forward = first(forward), reverse = first(reverse), .groups = "drop"),
+    by = "pair_name"
+  ) %>%
+  left_join(
+    hits %>%
+      filter(is_nontarget) %>%
+      group_by(pair_name) %>%
+      summarise(
+        worst_nontarget_pct    = max(pct_identity, na.rm = TRUE),
+        worst_nontarget_evalue = min(hsp_evalue,   na.rm = TRUE),
+        any_junction_nontarget = any(spans_junction, na.rm = TRUE),
+        nontarget_species_hit  = paste(sort(unique(species)), collapse = ", "),
+        .groups = "drop"
+      ),
+    by = "pair_name"
+  ) %>%
+  left_join(
+    hits %>%
+      filter(species == TARGET_SPECIES) %>%
+      group_by(pair_name) %>%
+      summarise(
+        target_best_pct    = max(pct_identity, na.rm = TRUE),
+        target_best_evalue = min(hsp_evalue,   na.rm = TRUE),
+        .groups = "drop"
+      ),
+    by = "pair_name"
+  ) %>%
+  replace_na(list(
+    worst_nontarget_pct    = 0,
+    worst_nontarget_evalue = 99,
+    any_junction_nontarget = FALSE,
+    nontarget_species_hit  = "none",
+    target_best_pct        = 0,
+    target_best_evalue     = 99
+  )) %>%
+  mutate(
+    no_target_hit  = target_best_pct == 0,
+    flag_85        = worst_nontarget_pct > PCT_CUTOFF_LO | any_junction_nontarget,
+    flag_90        = worst_nontarget_pct > PCT_CUTOFF_HI | any_junction_nontarget,
+    flag_100       = worst_nontarget_pct >= PCT_CUTOFF_PERFECT,
+    recommendation = case_when(
+      no_target_hit & (any_junction_nontarget | worst_nontarget_pct > PCT_CUTOFF_HI) ~
+        "CAUTION - no target hit AND concerning non-target hits",
+      no_target_hit ~
+        "CAUTION - no hit against target species (sea otter)",
+      flag_100 & any_junction_nontarget ~
+        "CRITICAL - perfect match + junction span in non-target",
+      flag_100 ~
+        "CRITICAL - perfect match (100% identity) in non-target",
+      any_junction_nontarget & worst_nontarget_pct > PCT_CUTOFF_HI ~
+        "MANUAL CHECK - >90% identity + junction span in non-target",
+      any_junction_nontarget ~
+        "MANUAL CHECK - junction span detected in non-target",
+      worst_nontarget_pct > PCT_CUTOFF_HI ~
+        "MANUAL CHECK - pct_identity > 90% in non-target",
+      worst_nontarget_pct > PCT_CUTOFF_LO ~
+        "REVIEW - pct_identity 85-90% in non-target",
+      worst_nontarget_evalue < EVALUE_CUTOFF ~
+        "REVIEW - significant e-value in non-target (but low identity)",
+      TRUE ~ "PROCEED - no concerning non-target hits"
+    )
+  ) %>%
+  arrange(desc(flag_100), desc(flag_90), desc(flag_85), desc(worst_nontarget_pct))
+
+flagged_100     <- pair_summary %>% filter(flag_100)
+flagged_90_only <- pair_summary %>% filter(flag_90 & !flag_100 & !no_target_hit)
+flagged_85_only <- pair_summary %>% filter(flag_85 & !flag_90 & !no_target_hit)
+clean           <- pair_summary %>% filter(!flag_85 & !no_target_hit)
+
+write_csv(pair_summary,    file.path(OUTDIR, "all_pairs_summary.csv"))
+write_csv(flagged_100,     file.path(OUTDIR, "critical_pairs_100pct.csv"))
+write_csv(flagged_90_only, file.path(OUTDIR, "flagged_pairs_90pct.csv"))
+write_csv(flagged_85_only, file.path(OUTDIR, "review_pairs_85to90pct.csv"))
+write_csv(clean,           file.path(OUTDIR, "clean_pairs.csv"))
+```
+
+Quick counts:
+
+| Category | n |
+|---|---|
+| Total primer pairs | `r nrow(pair_summary)` |
+| No hit against sea otter | `r sum(pair_summary$no_target_hit)` |
+| **CRITICAL: perfect match (100%)** in non-target | `r nrow(flagged_100)` |
+| **Flagged at 90%** (manual Primer-BLAST check recommended) | `r nrow(flagged_90_only)` |
+| **Flagged at 85% only** (borderline; worth a look) | `r nrow(flagged_85_only)` |
+| Proceed (no hits above 85% in non-target) | `r nrow(clean)` |
+
+The full summary table is below and saved to `blast_figures/all_pairs_summary.csv`.
+
+```{r summary-table}
+rec_colors <- c(
+  "CAUTION - no target hit AND concerning non-target hits"    = "#cc0000",
+  "CAUTION - no hit against target species (sea otter)"       = "#e06666",
+  "CRITICAL - perfect match + junction span in non-target"    = "#4a0000",
+  "CRITICAL - perfect match (100% identity) in non-target"   = "#7b0000",
+  "MANUAL CHECK - >90% identity + junction span in non-target" = "#f6a623",
+  "MANUAL CHECK - junction span detected in non-target"       = "#f6a623",
+  "MANUAL CHECK - pct_identity > 90% in non-target"          = "#f6a623",
+  "REVIEW - pct_identity 85-90% in non-target"               = "#ffd966",
+  "REVIEW - significant e-value in non-target (but low identity)" = "#d9ead3",
+  "PROCEED - no concerning non-target hits"                   = "#b7e1cd"
+)
+
+pair_summary %>%
+  select(pair_name, no_target_hit, flag_85, flag_90, flag_100,
+         worst_nontarget_pct, any_junction_nontarget,
+         nontarget_species_hit, recommendation) %>%
+  rename(
+    `Pair`                 = pair_name,
+    `No target hit`        = no_target_hit,
+    `Flag >85%`            = flag_85,
+    `Flag >90%`            = flag_90,
+    `Flag 100%`            = flag_100,
+    `Worst non-target %id` = worst_nontarget_pct,
+    `Junction hit`         = any_junction_nontarget,
+    `Non-target species`   = nontarget_species_hit,
+    `Recommendation`       = recommendation
+  ) %>%
+  kable(digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE, font_size = 12) %>%
+  column_spec(
+    9,
+    background = rec_colors[pair_summary$recommendation],
+    color = ifelse(pair_summary$recommendation %in%
+                     c("CAUTION - no target hit AND concerning non-target hits",
+                       "CAUTION - no hit against target species (sea otter)",
+                       "CRITICAL - perfect match + junction span in non-target",
+                       "CRITICAL - perfect match (100% identity) in non-target"),
+                   "white", "black")
+  )
+```
+
+---
+
+## Figure 1: Max % Identity Heatmap
+
+Max BLAST % identity per primer pair x species. Numbers in each cell show the 
+highest % identity hit found. The color scale transitions from green through yellow 
+at `r PCT_CUTOFF_LO`% and red at `r PCT_CUTOFF_HI`%. The sea otter column (target) 
+is outlined in blue. Pairs are sorted by worst non-target hit (cleanest at top).
+
+```{r heatmap-identity, fig.width=8, fig.height=max(5, length(all_pairs) * 0.22 + 2)}
+max_identity <- hits %>%
+  group_by(pair_name, species) %>%
+  summarise(max_pct = max(pct_identity, na.rm = TRUE), .groups = "drop")
+
+grid <- expand_grid(pair_name = all_pairs, species = all_species) %>%
+  left_join(max_identity, by = c("pair_name", "species")) %>%
+  replace_na(list(max_pct = 0))
+
+pair_order <- grid %>%
+  filter(species != TARGET_SPECIES) %>%
+  group_by(pair_name) %>%
+  summarise(worst_nontarget = max(max_pct)) %>%
+  arrange(worst_nontarget, pair_name) %>%
+  pull(pair_name)
+
+grid <- grid %>%
+  mutate(pair_name = factor(pair_name, levels = pair_order))
+
+ggplot(grid, aes(x = species, y = pair_name, fill = max_pct)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(
+    data = filter(grid, max_pct > 0),
+    aes(label = round(max_pct, 0)),
+    size = 2.5, color = "white", fontface = "bold"
+  ) +
+  scale_fill_gradientn(
+    colours = c("#d9ead3", "#ffd966", "#e06666", "#cc0000", "#4a0000"),
+    values  = rescale(c(0, PCT_CUTOFF_LO, PCT_CUTOFF_HI, 99, 100)),
+    limits  = c(0, 100),
+    name    = "Max % identity\n(best BLAST hit)"
+  ) +
+  geom_vline(
+    xintercept = which(sort(all_species) == TARGET_SPECIES) - 0.5,
+    color = "grey40", linetype = "dashed", linewidth = 0.6
+  ) +
+  annotate("rect",
+    xmin = which(sort(all_species) == TARGET_SPECIES) - 0.5,
+    xmax = which(sort(all_species) == TARGET_SPECIES) + 0.5,
+    ymin = 0.5, ymax = length(all_pairs) + 0.5,
+    fill = NA, color = "steelblue", linewidth = 0.8
+  ) +
+  labs(
+    title    = "Max BLAST % Identity per Primer Pair x Species",
+    subtitle = paste0(
+      "Blue outline = target species (", TARGET_SPECIES, ").  ",
+      "Yellow = >", PCT_CUTOFF_LO, "%; red = >", PCT_CUTOFF_HI, "%; dark red = 100%.\n",
+      "Pairs sorted by worst non-target hit (cleanest at top)."
+    ),
+    x = "Species", y = "Primer Pair"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.y      = element_text(size = 7),
+    axis.text.x      = element_text(angle = 30, hjust = 1),
+    plot.title       = element_text(face = "bold"),
+    plot.subtitle    = element_text(size = 8, color = "grey40"),
+    legend.position  = "right",
+    panel.grid       = element_blank()
+  )
+```
+
+---
+---
+
+## Critical Pairs (100% identity in non-target)
+
+These **`r nrow(flagged_100)`** pairs had at least one perfect-match BLAST hit in a
+non-target species. These are the highest priority to investigate or drop.
+Also saved to `blast_figures/critical_pairs_100pct.csv`.
+
+Note that this does not guarantee that non-target PCR amplification will occur.
+Forward and reverse binding sites may be too far apart for an amplicon to form.
+This script also ignores strand orientation and whether both primers match (vs. one).
+
+```{r critical-table}
+if (nrow(flagged_100) > 0) {
+  flagged_100 %>%
+    select(pair_name, forward, reverse, no_target_hit, flag_85, flag_90, flag_100,
+           worst_nontarget_pct, any_junction_nontarget,
+           nontarget_species_hit, recommendation) %>%
+    rename(
+      `Pair`                 = pair_name,
+      `Forward`              = forward,
+      `Reverse`              = reverse,
+      `No target hit`        = no_target_hit,
+      `Flag >85%`            = flag_85,
+      `Flag >90%`            = flag_90,
+      `Flag 100%`            = flag_100,
+      `Worst non-target %id` = worst_nontarget_pct,
+      `Junction hit`         = any_junction_nontarget,
+      `Non-target species`   = nontarget_species_hit,
+      `Recommendation`       = recommendation
+    ) %>%
+    kable(digits = 3) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = TRUE, font_size = 12)
+} else {
+  cat("No pairs had a perfect-match hit in a non-target species.")
+}
+```
+
+---
+
+## Manual Check Pairs (90-99% identity)
+
+These **`r nrow(flagged_90_only)`** pairs had non-target hits above 90% but below
+100% identity (or junction hits), and no perfect-match hit. Run through
+[Primer-BLAST](https://www.ncbi.nlm.nih.gov/tools/primer-blast/) to confirm
+whether they would actually form an amplicon.
+Also saved to `blast_figures/flagged_pairs_90pct.csv`.
+
+```{r flagged-table}
+if (nrow(flagged_90_only) > 0) {
+  flagged_90_only %>%
+    select(pair_name, forward, reverse, no_target_hit, flag_85, flag_90, flag_100,
+           worst_nontarget_pct, any_junction_nontarget,
+           nontarget_species_hit, recommendation) %>%
+    rename(
+      `Pair`                 = pair_name,
+      `Forward`              = forward,
+      `Reverse`              = reverse,
+      `No target hit`        = no_target_hit,
+      `Flag >85%`            = flag_85,
+      `Flag >90%`            = flag_90,
+      `Flag 100%`            = flag_100,
+      `Worst non-target %id` = worst_nontarget_pct,
+      `Junction hit`         = any_junction_nontarget,
+      `Non-target species`   = nontarget_species_hit,
+      `Recommendation`       = recommendation
+    ) %>%
+    kable(digits = 3) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = TRUE, font_size = 12)
+} else {
+  cat("No pairs fall in the 90-99% range.")
+}
+```
+
+---
+
+## Review Pairs (85-90% only)
+
+These **`r nrow(flagged_85_only)`** pairs had non-target hits between 85-90% identity
+but nothing above 90% and no junction hits. They are lower priority but worth a
+second look if your final panel needs to be especially stringent.
+Also saved to `blast_figures/review_pairs_85to90pct.csv`.
+
+```{r review-table}
+if (nrow(flagged_85_only) > 0) {
+  flagged_85_only %>%
+    select(pair_name, forward, reverse, worst_nontarget_pct,
+           nontarget_species_hit, recommendation) %>%
+    rename(
+      `Pair`                 = pair_name,
+      `Forward`              = forward,
+      `Reverse`              = reverse,
+      `Worst non-target %id` = worst_nontarget_pct,
+      `Non-target species`   = nontarget_species_hit,
+      `Recommendation`       = recommendation
+    ) %>%
+    kable(digits = 3) %>%
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = TRUE, font_size = 12)
+} else {
+  cat("No pairs fall in the 85-90% borderline range.")
+}
+```
+
+---
+
+## Clean Pairs
+
+These **`r nrow(clean)`** pairs had no non-target hits above 85% and at least one
+sea otter BLAST hit. Also saved to `blast_figures/clean_pairs.csv`.
+
+```{r clean-table}
+clean %>%
+  select(pair_name, forward, reverse, target_best_pct,
+         worst_nontarget_pct, recommendation) %>%
+  rename(
+    `Pair`                 = pair_name,
+    `Forward`              = forward,
+    `Reverse`              = reverse,
+    `Best sea otter %id`   = target_best_pct,
+    `Worst non-target %id` = worst_nontarget_pct,
+    `Recommendation`       = recommendation
+  ) %>%
+  kable(digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE, font_size = 12)
+```
+
+---
+
+*Generated with `analyze_blast_results.Rmd` on `r Sys.Date()`.*
